@@ -1,4 +1,8 @@
-﻿using CryptoExchange.Net.Authentication;
+﻿using System;
+using System.Linq;
+using System.Threading;
+using System.Threading.Tasks;
+using CryptoExchange.Net.Authentication;
 using GateIo.Net.Clients;
 
 internal class Program
@@ -16,36 +20,71 @@ internal class Program
             return;
         }
 
-        using var restClient = new GateIoRestClient(o =>
+        const string settle = "usdt";
+        const string contract = "BTC_USDT";
+
+        using var rest = new GateIoRestClient(o =>
         {
             o.ApiCredentials = new ApiCredentials(apiKey, apiSecret);
         });
 
         try
         {
-            // Получение позиций
-            var positionsResult = await restClient.PerpetualFuturesApi.Trading.GetPositionsAsync("BTC_USDT");
-            if (positionsResult.Success && positionsResult.Data.Any())
+            // ----- АККАУНТ (перпеты)
+            var account = await rest.PerpetualFuturesApi.Account.GetAccountAsync(settle);
+            if (account.Success)
             {
-                foreach (var p in positionsResult.Data)
-                {
-                    Console.WriteLine($"• {p.Contract} | size: {p.Size} | entry: {p.EntryPrice} | mark: {p.MarkPrice} | PnL: {p.UnrealisedPnl}");
-                }
+                var a = account.Data;
+                Console.WriteLine($"Аккаунт {settle.ToUpper()} | Total: {a.Total} | Avail: {a.Available} | UnrealisedPnL: {a.UnrealisedPnl}");
             }
             else
             {
-                Console.WriteLine("Открытых позиций нет или ошибка: " + positionsResult.Error?.Message);
+                Console.WriteLine("Ошибка аккаунта: " + account.Error?.Message);
             }
 
-            // Получение информации об аккаунте
-            var accountResult = await restClient.PerpetualFuturesApi.Account.GetAccountAsync("usdt");
-            if (accountResult.Success)
+            // ----- ПОЗИЦИИ (все по USDT-perp)
+            var positions = await rest.PerpetualFuturesApi.Trading.GetPositionsAsync(settle);
+            if (positions.Success)
             {
-                Console.WriteLine($"Доступный баланс: {accountResult.Data.Available} USDT | Общий: {accountResult.Data.Total} USDT");
+                var open = positions.Data
+                    .Where(p => p.Size != 0L)
+                    .ToList();
+
+                if (open.Count == 0)
+                {
+                    Console.WriteLine("Открытых позиций не найдено.");
+                }
+                else
+                {
+                    Console.WriteLine("Открытые позиции:");
+                    foreach (var p in open)
+                    {
+                        // side выводим по знаку размера
+                        var side = p.Size > 0 ? "LONG" : "SHORT";
+
+                        // безопасно считаем %PnL по mark/entry
+                        decimal? pnlPct = null;
+                        if (p.EntryPrice.HasValue && p.EntryPrice.Value != 0 && p.MarkPrice.HasValue)
+                        {
+                            var raw = (p.MarkPrice.Value - p.EntryPrice.Value) / p.EntryPrice.Value * 100m;
+                            // если хочешь учитывать направление позиции знаковым коэффициентом:
+                            raw *= p.Size > 0 ? 1 : -1;
+                            pnlPct = Math.Round(raw, 4);
+                        }
+
+                        Console.WriteLine(
+                            $"• {p.Contract} | {side} | size={p.Size} | lev={p.Leverage} | " +
+                            $"entry={p.EntryPrice?.ToString() ?? "-"} | mark={p.MarkPrice?.ToString() ?? "-"} | " +
+                            $"liq={p.LiquidationPrice?.ToString() ?? "-"} | uPnL={p.UnrealisedPnl?.ToString() ?? "-"} | " +
+                            $"uPnL%={(pnlPct?.ToString() ?? "-")}"
+                        );
+                    }
+                }
+
             }
             else
             {
-                Console.WriteLine("Ошибка получения баланса: " + accountResult.Error?.Message);
+                Console.WriteLine("Ошибка позиций: " + positions.Error?.Message);
             }
         }
         catch (Exception ex)
@@ -53,30 +92,42 @@ internal class Program
             Console.WriteLine("Ошибка REST: " + ex.Message);
         }
 
-        using var socketClient = new GateIoSocketClient(o =>
+        // ----- WEBSOCKETЫ
+        using var socket = new GateIoSocketClient(o =>
         {
             o.ApiCredentials = new ApiCredentials(apiKey, apiSecret);
         });
 
         try
         {
-            // Правильный вызов WebSocket подписки с учетом сигнатуры метода
-            var subResult = await socketClient.PerpetualFuturesApi.SubscribeToTradeUpdatesAsync(
-                settlementAsset: "usdt",  // Settlement asset (usdt, btc или usd)
-                contract: "BTC_USDT",     // Контракт
-                onMessage: data =>        // Обработчик сообщений
+            // ТИКЕР по контракту (даёт FundingRate/Indicative, MarkPrice, IndexPrice и т.д.)
+            var tickerSub = await socket.PerpetualFuturesApi.SubscribeToTickerUpdatesAsync(
+                settle, contract,
+                msg =>
                 {
-                    foreach (var t in data.Data)
-                        Console.WriteLine($"[WS] Trade {t.Contract} {t.Price} x {t.Quantity} @ {t.CreateTime:HH:mm:ss}");
+                    var t = msg.Data.First();
+                    Console.WriteLine($"[TICKER] {t.Contract} last:{t.LastPrice} mark:{t.MarkPrice} idx:{t.IndexPrice} fr:{t.FundingRate} fri:{t.FundingRateIndicative}");
                 },
-                ct: default);            // CancellationToken
+                ct: CancellationToken.None);
 
-            if (!subResult.Success)
-                Console.WriteLine("Ошибка подписки WS: " + subResult.Error?.Message);
-            else
-                Console.WriteLine("WS подписка активна. Нажмите Ctrl+C для выхода.");
+            if (!tickerSub.Success)
+                Console.WriteLine("Ошибка подписки на тикер: " + tickerSub.Error?.Message);
 
-            await Task.Delay(10000); // Бесконечное ожидание
+            // СДЕЛКИ по контракту
+            var tradesSub = await socket.PerpetualFuturesApi.SubscribeToTradeUpdatesAsync(
+                settle, contract,
+                msg =>
+                {
+                    foreach (var t in msg.Data)
+                        Console.WriteLine($"[TRADES] {t.Contract} {t.Price} x {t.Quantity} @ {t.CreateTime:HH:mm:ss}");
+                },
+                ct: CancellationToken.None);
+
+            if (!tradesSub.Success)
+                Console.WriteLine("Ошибка подписки на трейды: " + tradesSub.Error?.Message);
+
+            Console.WriteLine("WS подписки активны. Нажмите Ctrl+C для выхода.");
+            await Task.Delay(Timeout.Infinite);
         }
         catch (Exception ex)
         {
